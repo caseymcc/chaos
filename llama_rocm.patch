@@ -1,0 +1,166 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1c9afed..7479336 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -69,6 +69,7 @@ option(LLAMA_BLAS                   "llama: use BLAS"
+ option(LLAMA_BLAS_VENDOR            "llama: BLA_VENDOR from https://cmake.org/cmake/help/latest/module/FindBLAS.html#blas-lapack-vendors" Generic)
+ option(LLAMA_CUBLAS                 "llama: use cuBLAS"                                     OFF)
+ option(LLAMA_CLBLAST                "llama: use CLBlast"                                    OFF)
++option(LLAMA_HIPBLAS                "llama: use hipBLAS"                                    OFF)
+ 
+ option(LLAMA_BUILD_TESTS            "llama: build tests"    ${LLAMA_STANDALONE})
+ option(LLAMA_BUILD_EXAMPLES         "llama: build examples" ${LLAMA_STANDALONE})
+@@ -210,6 +211,35 @@ if (LLAMA_CLBLAST)
+     endif()
+ endif()
+ 
++if (LLAMA_HIPBLAS)
++    list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
++
++    if (NOT ${CMAKE_C_COMPILER_ID} MATCHES "Clang")
++        message(WARNING "Only LLVM is supported for HIP, hint: CC=/opt/rocm/llvm/bin/clang")
++    endif()
++    if (NOT ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang")
++        message(WARNING "Only LLVM is supported for HIP, hint: CXX=/opt/rocm/llvm/bin/clang++")
++    endif()
++
++    find_package(hip)
++    find_package(hipblas)
++
++    if (${hipblas_FOUND} AND ${hip_FOUND})
++        message(STATUS "HIP and hipBLAS found")
++        add_compile_definitions(GGML_USE_HIPBLAS GGML_USE_CUBLAS)
++        add_library(ggml-rocm OBJECT ggml-cuda.cu ggml-cuda.h)
++        set_source_files_properties(ggml-cuda.cu PROPERTIES LANGUAGE CXX)
++        target_link_libraries(ggml-rocm PRIVATE hip::device PUBLIC hip::host roc::hipblas)
++
++        if (LLAMA_STATIC)
++            message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
++        endif()
++        set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ggml-rocm)
++    else()
++        message(WARNING "hipBLAS or HIP not found. Try setting CMAKE_PREFIX_PATH=/opt/rocm")
++    endif()
++endif()
++
+ if (LLAMA_ALL_WARNINGS)
+     if (NOT MSVC)
+         set(c_flags
+diff --git a/Makefile b/Makefile
+index cefa0b4..892503c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -13,8 +13,8 @@ ifndef UNAME_M
+ UNAME_M := $(shell uname -m)
+ endif
+ 
+-CCV := $(shell $(CC) --version | head -n 1)
+-CXXV := $(shell $(CXX) --version | head -n 1)
++CCV  = $(shell $(CC)  --version | head -n 1)
++CXXV = $(shell $(CXX) --version | head -n 1)
+ 
+ # Mac OS + Arm can report x86_64
+ # ref: https://github.com/ggerganov/whisper.cpp/issues/66#issuecomment-1282546789
+@@ -148,6 +148,19 @@ ifdef LLAMA_CLBLAST
+ ggml-opencl.o: ggml-opencl.c ggml-opencl.h
+ 	$(CC) $(CFLAGS) -c $< -o $@
+ endif
++ifdef LLAMA_HIPBLAS
++	ROCM_PATH  ?= /opt/rocm
++	CC         := $(ROCM_PATH)/llvm/bin/clang
++	CXX        := $(ROCM_PATH)/llvm/bin/clang++
++	GPU_TARGETS = gfx900 gfx906 gfx908 gfx90a gfx1030
++	CFLAGS     += -DGGML_USE_HIPBLAS -DGGML_USE_CUBLAS $(shell $(ROCM_PATH)/bin/hipconfig -C)
++	CXXFLAGS   += -DGGML_USE_HIPBLAS -DGGML_USE_CUBLAS $(shell $(ROCM_PATH)/bin/hipconfig -C)
++	LDFLAGS    += -L/opt/rocm/lib -Wl,-rpath=$(ROCM_PATH)/lib -lhipblas -lamdhip64
++	OBJS       += ggml-cuda.o
++ggml-cuda.o: CXXFLAGS += $(addprefix --offload-arch=,$(GPU_TARGETS))
++ggml-cuda.o: ggml-cuda.cu ggml-cuda.h
++	$(CXX) $(CXXFLAGS) -x hip -c -o $@ $<
++endif
+ ifneq ($(filter aarch64%,$(UNAME_M)),)
+ 	# Apple M1, M2, etc.
+ 	# Raspberry Pi 3, 4, Zero 2 (64-bit)
+diff --git a/ggml-cuda.cu b/ggml-cuda.cu
+index 35d2e45..64ddc68 100644
+--- a/ggml-cuda.cu
++++ b/ggml-cuda.cu
+@@ -4,9 +4,56 @@
+ #include <stdio.h>
+ #include <atomic>
+ 
++#if defined(GGML_USE_HIPBLAS)
++#include <hip/hip_runtime.h>
++#include <hipblas/hipblas.h>
++#include <hip/hip_fp16.h>
++#define CUBLAS_COMPUTE_32F HIPBLAS_R_32F
++#define CUBLAS_COMPUTE_32F_FAST_16F HIPBLAS_R_32F
++#define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
++#define CUBLAS_OP_N HIPBLAS_OP_N
++#define CUBLAS_OP_T HIPBLAS_OP_T
++#define CUBLAS_STATUS_SUCCESS HIPBLAS_STATUS_SUCCESS
++#define CUBLAS_TF32_TENSOR_OP_MATH 0
++#define CUDA_R_16F  HIPBLAS_R_16F
++#define CUDA_R_32F  HIPBLAS_R_32F
++#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
++#define cublasCreate hipblasCreate
++#define cublasGemmEx hipblasGemmEx
++#define cublasHandle_t hipblasHandle_t
++#define cublasSetMathMode(handle, mode) CUBLAS_STATUS_SUCCESS
++#define cublasSetStream hipblasSetStream
++#define cublasSgemm hipblasSgemm
++#define cublasStatus_t hipblasStatus_t
++#define cudaDeviceSynchronize hipDeviceSynchronize
++#define cudaError_t hipError_t
++#define cudaEvent_t hipEvent_t
++#define cudaEventCreateWithFlags hipEventCreateWithFlags
++#define cudaEventDisableTiming hipEventDisableTiming
++#define cudaEventRecord hipEventRecord
++#define cudaFree hipFree
++#define cudaFreeHost hipHostFree
++#define cudaGetErrorString hipGetErrorString
++#define cudaGetLastError hipGetLastError
++#define cudaMalloc hipMalloc
++#define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
++#define cudaMemcpy hipMemcpy
++#define cudaMemcpy2DAsync hipMemcpy2DAsync
++#define cudaMemcpyAsync hipMemcpyAsync
++#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
++#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
++#define cudaOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize
++#define cudaStream_t hipStream_t
++#define cudaStreamCreateWithFlags hipStreamCreateWithFlags
++#define cudaStreamNonBlocking hipStreamNonBlocking
++#define cudaStreamSynchronize hipStreamSynchronize
++#define cudaStreamWaitEvent hipStreamWaitEvent
++#define cudaSuccess hipSuccess
++#else
+ #include <cuda_runtime.h>
+ #include <cublas_v2.h>
+ #include <cuda_fp16.h>
++#endif
+ 
+ #include "ggml-cuda.h"
+ #include "ggml.h"
+@@ -85,7 +132,7 @@ static_assert(sizeof(block_q8_0) == sizeof(ggml_fp16_t) + QK8_0, "wrong q8_0 blo
+ 
+ #define CUDA_MUL_BLOCK_SIZE 256
+ #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
+-#define CUDA_DMMV_BLOCK_SIZE 32 // dmmv = dequantize_mul_mat_vec
++#define CUDA_DMMV_BLOCK_SIZE 64 // dmmv = dequantize_mul_mat_vec
+ 
+ static __global__ void mul_f32(const float * x, const float * y, float * dst, const int kx, const int ky) {
+     const int i = blockDim.x*blockIdx.x + threadIdx.x;
+diff --git a/ggml.c b/ggml.c
+index f4a5a8d..1077c10 100644
+--- a/ggml.c
++++ b/ggml.c
+@@ -142,7 +142,7 @@ inline static void* ggml_aligned_malloc(size_t size) {
+ #endif
+ #elif defined(GGML_USE_OPENBLAS)
+ #include <cblas.h>
+-#elif defined(GGML_USE_CUBLAS)
++#elif defined(GGML_USE_CUBLAS) | defined(GGML_USE_HIPBLAS)
+ #include "ggml-cuda.h"
+ #elif defined(GGML_USE_CLBLAST)
+ #include "ggml-opencl.h"
